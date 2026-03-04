@@ -1,0 +1,45 @@
+[project]
+name = "gllm-test-project"
+version = "0.1.0"
+description = "Test project to verify optional dependency imports"
+requires-python = ">=3.11"
+dependencies = [
+    "gllm-pipeline[aurelio]",
+]
+
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple/"
+priority = "primary"
+
+[[tool.uv.index]]
+name = "gen-ai-internal"
+url = "https://glsdk.gdplabs.id/gen-ai-internal/simple/"
+priority = "supplemental"
+
+[[tool.uv.index]]
+name = "gen-ai"
+url = "https://glsdk.gdplabs.id/gen-ai/simple/"
+priority = "supplemental"
+
+[[tool.uv.index]]
+name = "gen-ai-internal-publication"
+url = "https://glsdk.gdplabs.id/gen-ai-internal/"
+priority = "explicit"
+
+[[tool.uv.index]]
+name = "gen-ai-publication"
+url = "https://glsdk.gdplabs.id/gen-ai/"
+priority = "explicit"
+
+[[tool.uv.index]]
+name = "pytorch-cpu-src"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "supplemental"
+
+[tool.uv.sources]
+gllm-core = { index = "gen-ai-internal" }
+gllm-inference = { index = "gen-ai-internal" }
+gllm-pipeline = { path = "../dev2/libs/gllm-pipeline", editable = true }
+torch = { index = "pytorch-cpu-src" }
