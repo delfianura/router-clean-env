@@ -76,3 +76,6 @@ class Router:
 
     def route_many(self, texts: list[str]) -> list[str | None]:
         return [self.route(t) for t in texts]
+
+    def has_route(self, name: str) -> bool:
+        return any(r.name == name for r in self._routes)
