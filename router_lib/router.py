@@ -58,3 +58,6 @@ class Router:
     def _cache_set(self, query: str, result: str | None) -> None:
         if self._cache_ttl is not None:
             self._cache[query] = (result, time.monotonic())
+
+    def route_many(self, queries: list[str]) -> list[str | None]:
+        return [self.route(q) for q in queries]
