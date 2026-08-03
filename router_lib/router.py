@@ -21,6 +21,7 @@ class Router:
 
     def add_route(self, route: Route) -> None:
         self._routes.append(route)
+        self._cache.clear()
 
     def route(self, query: str) -> str | None:
         if self._cache_ttl is not None:
