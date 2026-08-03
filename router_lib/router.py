@@ -41,7 +41,8 @@ class Router:
         return result
 
     def _best_match(self, text: str) -> str | None:
-        matches = [r for r in self._routes if any(k in text for k in r.keywords)]
+        lowered = text.lower()
+        matches = [r for r in self._routes if any(k.lower() in lowered for k in r.keywords)]
         if not matches:
             return self._default_route
         matches.sort(key=lambda r: r.priority, reverse=True)
