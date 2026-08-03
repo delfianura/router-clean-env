@@ -29,6 +29,10 @@ class Router:
         self._routes.append(route)
         self._cache.clear()
 
+    def remove_route(self, name: str) -> None:
+        self._routes = [r for r in self._routes if r.name != name]
+        self._cache.clear()
+
     _MISS = object()
 
     def route(self, text: str) -> str | None:
