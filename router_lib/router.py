@@ -39,6 +39,10 @@ class Router:
                 r.priority = priority
         self._cache.clear()
 
+    def clear_routes(self) -> None:
+        self._routes = []
+        self._cache.clear()
+
     _MISS = object()
 
     def route(self, text: str) -> str | None:
