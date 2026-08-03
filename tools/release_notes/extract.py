@@ -4,13 +4,15 @@
 No LLM calls, no tag required to already exist, no dependency on PR labels.
 
 The PR range is found from the last published release's timestamp (via the
-Releases API), not from local/manual git tags. Each PR is categorized by
-parsing its title as a Conventional Commit (`feat: ...`, `fix(scope): ...`,
-`feat!: ...` for breaking) instead of relying on someone having applied a
-label. Then, same as before, each merged PR's body is read for the
+Releases API), not from local/manual git tags. "## What's Changed" is a flat
+list of merged PRs, in the same order GitHub's own generated notes use — no
+category subheadings. Each merged PR's body is then read for the
 `<!-- release-note:start -->...<!-- release-note:end -->` marker to build a
-"### Summary" section, and `<!-- release-note-breaking:start -->...-end -->`
-for a "### Breaking Changes" section.
+"### Summary" section directly beneath it, one bullet per user-facing PR.
+A PR whose title carries the Conventional Commit "!" (`feat!: ...`) or whose
+body has a filled-in `<!-- release-note-breaking:start -->...-end -->` marker
+gets its summary bullet prefixed with "**Breaking:**" instead of a separate
+section.
 
 Usage:
     python extract.py --repo OWNER/REPO --tag v0.3.2
@@ -37,21 +39,8 @@ BREAKING_RE = re.compile(
 )
 
 # Conventional Commit PR title: "type(scope)!: subject". Scope and "!" optional.
-TITLE_RE = re.compile(r"^(?P<type>[a-zA-Z]+)(?:\([^)]*\))?(?P<bang>!)?:\s*(?P<subject>.+)$")
-
-CATEGORY_BY_TYPE = {
-    "feat": "Features",
-    "fix": "Fixes",
-    "perf": "Fixes",
-    "docs": "Documentation",
-    "refactor": "Other Changes",
-    "chore": "Other Changes",
-    "test": "Other Changes",
-    "ci": "Other Changes",
-    "style": "Other Changes",
-    "build": "Other Changes",
-}
-CATEGORY_ORDER = ["Breaking Changes", "Features", "Fixes", "Documentation", "Other Changes"]
+# The "!" is the only part we need — it's the title-level breaking-change signal.
+TITLE_RE = re.compile(r"^[a-zA-Z]+(?:\([^)]*\))?(?P<bang>!)?:\s*.+$")
 
 
 def run_gh(args: list[str]) -> str:
@@ -100,16 +89,10 @@ def list_merged_prs(repo: str, base: str, since: str | None) -> list[dict]:
     return prs
 
 
-def categorize(title: str) -> tuple[str, bool]:
-    """Return (category, is_breaking) parsed from a Conventional Commit PR title."""
+def is_breaking_title(title: str) -> bool:
+    """Whether a Conventional Commit PR title carries the "!" breaking marker."""
     m = TITLE_RE.match(title.strip())
-    if not m:
-        return "Other Changes", False
-    is_breaking = m.group("bang") == "!"
-    category = CATEGORY_BY_TYPE.get(m.group("type").lower(), "Other Changes")
-    if is_breaking:
-        category = "Breaking Changes"
-    return category, is_breaking
+    return bool(m and m.group("bang") == "!")
 
 
 def fetch_pr_body(repo: str, number: int) -> str:
@@ -144,38 +127,23 @@ def compose(repo: str, tag: str, base: str, prefix: str | None) -> str:
 
     prs = list_merged_prs(repo, base, since)
 
-    by_category: dict[str, list[str]] = {}
+    whats_changed_lines = []
     summary_lines = []
-    breaking_lines = []
     for pr in prs:
         n = pr["number"]
-        category, title_breaking = categorize(pr["title"])
-        by_category.setdefault(category, []).append(
-            f"* {pr['title']} by @{pr['author']['login']} in {pr['url']}"
-        )
+        title_breaking = is_breaking_title(pr["title"])
+        whats_changed_lines.append(f"* {pr['title']} by @{pr['author']['login']} in {pr['url']}")
 
         body = fetch_pr_body(repo, n)
         note = extract_note(body)
-        if note:
+        breaking = extract_breaking(body) or (note if title_breaking else None)
+
+        if breaking:
+            summary_lines.append(f"- **Breaking:** {breaking} (#{n})")
+        elif note:
             summary_lines.append(f"- {note} (#{n})")
 
-        breaking = extract_breaking(body)
-        if breaking:
-            breaking_lines.append(f"- {breaking} (#{n})")
-        elif title_breaking and note:
-            # Title says breaking but no dedicated marker was filled in.
-            breaking_lines.append(f"- {note} (#{n})")
-
-    parts = ["## What's Changed"]
-    for category in CATEGORY_ORDER:
-        if category in by_category:
-            parts.append(f"### {category}\n" + "\n".join(by_category[category]))
-    whats_changed = "\n".join(parts)
-
-    body_parts = [whats_changed]
-
-    if breaking_lines:
-        body_parts.append("### Breaking Changes\n\n" + "\n".join(breaking_lines))
+    body_parts = ["## What's Changed\n" + "\n".join(whats_changed_lines)]
 
     if summary_lines:
         body_parts.append("### Summary\n\n" + "\n".join(summary_lines))
