@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Deterministic release-note composer.
 
-No LLM calls. Pulls the GitHub-generated changelog (respects .github/release.yml
-label categories) via the generate-notes API, then reads the per-PR
-`<!-- release-note:start -->...<!-- release-note:end -->` marker block out of
-each merged PR's body to build a "### Summary" section.
+No LLM calls, no tag required to already exist, no dependency on PR labels.
+
+The PR range is found from the last published release's timestamp (via the
+Releases API), not from local/manual git tags. Each PR is categorized by
+parsing its title as a Conventional Commit (`feat: ...`, `fix(scope): ...`,
+`feat!: ...` for breaking) instead of relying on someone having applied a
+label. Then, same as before, each merged PR's body is read for the
+`<!-- release-note:start -->...<!-- release-note:end -->` marker to build a
+"### Summary" section, and `<!-- release-note-breaking:start -->...-end -->`
+for a "### Breaking Changes" section.
 
 Usage:
-    python extract.py --repo OWNER/REPO --tag v0.2.0 --previous-tag v0.0.9
+    python extract.py --repo OWNER/REPO --tag v0.3.2
+    python extract.py --repo OWNER/REPO --tag v0.3.2 --prefix gllm_inference-v --base main
 
 Requires: `gh` CLI authenticated, Python 3.9+.
 """
@@ -18,6 +25,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 NOTE_RE = re.compile(
     r"<!--\s*release-note:start\s*-->(.*?)<!--\s*release-note:end\s*-->",
@@ -27,7 +35,23 @@ BREAKING_RE = re.compile(
     r"<!--\s*release-note-breaking:start\s*-->(.*?)<!--\s*release-note-breaking:end\s*-->",
     re.DOTALL,
 )
-PR_LINE_RE = re.compile(r"^\*\s.*?/pull/(\d+)\s*$", re.MULTILINE)
+
+# Conventional Commit PR title: "type(scope)!: subject". Scope and "!" optional.
+TITLE_RE = re.compile(r"^(?P<type>[a-zA-Z]+)(?:\([^)]*\))?(?P<bang>!)?:\s*(?P<subject>.+)$")
+
+CATEGORY_BY_TYPE = {
+    "feat": "Features",
+    "fix": "Fixes",
+    "perf": "Fixes",
+    "docs": "Documentation",
+    "refactor": "Other Changes",
+    "chore": "Other Changes",
+    "test": "Other Changes",
+    "ci": "Other Changes",
+    "style": "Other Changes",
+    "build": "Other Changes",
+}
+CATEGORY_ORDER = ["Breaking Changes", "Features", "Fixes", "Documentation", "Other Changes"]
 
 
 def run_gh(args: list[str]) -> str:
@@ -35,28 +59,57 @@ def run_gh(args: list[str]) -> str:
     return result.stdout
 
 
-def generate_notes(repo: str, tag: str, previous_tag: str) -> str:
+def get_last_release(repo: str, prefix: str | None) -> dict | None:
+    """Most recently published release, optionally scoped to a package's tag prefix.
+
+    Reads straight from the Releases API — no local git tags involved, so this
+    works even in a checkout that never fetched tags.
+    """
+    releases = json.loads(run_gh(["api", f"repos/{repo}/releases", "--paginate"]))
+    if prefix:
+        releases = [r for r in releases if r["tag_name"].startswith(prefix)]
+    if not releases:
+        return None
+    releases.sort(key=lambda r: r["published_at"], reverse=True)
+    return releases[0]
+
+
+def list_merged_prs(repo: str, base: str, since: str | None) -> list[dict]:
+    """Merged PRs against `base`, merged after `since` (ISO8601), oldest first."""
     out = run_gh(
         [
-            "api",
-            f"repos/{repo}/releases/generate-notes",
-            "-f",
-            f"tag_name={tag}",
-            "-f",
-            f"previous_tag_name={previous_tag}",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "merged",
+            "--base",
+            base,
+            "--limit",
+            "200",
+            "--json",
+            "number,title,mergedAt,url,author",
         ]
     )
-    return json.loads(out)["body"]
+    prs = json.loads(out)
+    if since:
+        since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        prs = [p for p in prs if datetime.fromisoformat(p["mergedAt"].replace("Z", "+00:00")) > since_dt]
+    prs.sort(key=lambda p: p["mergedAt"])
+    return prs
 
 
-def pr_numbers_in_order(generated_body: str) -> list[int]:
-    # Only the "## What's Changed" section lists merged PRs; "## New Contributors"
-    # bullets have the same "* ... /pull/N" shape and would otherwise duplicate PRs.
-    whats_changed = generated_body.split("## New Contributors")[0]
-    seen: dict[int, None] = {}
-    for n in PR_LINE_RE.findall(whats_changed):
-        seen[int(n)] = None
-    return list(seen)
+def categorize(title: str) -> tuple[str, bool]:
+    """Return (category, is_breaking) parsed from a Conventional Commit PR title."""
+    m = TITLE_RE.match(title.strip())
+    if not m:
+        return "Other Changes", False
+    is_breaking = m.group("bang") == "!"
+    category = CATEGORY_BY_TYPE.get(m.group("type").lower(), "Other Changes")
+    if is_breaking:
+        category = "Breaking Changes"
+    return category, is_breaking
 
 
 def fetch_pr_body(repo: str, number: int) -> str:
@@ -84,58 +137,69 @@ def extract_breaking(body: str) -> str | None:
     return " ".join(text.split())
 
 
-def compose(repo: str, tag: str, previous_tag: str) -> str:
-    generated = generate_notes(repo, tag, previous_tag)
-    numbers = pr_numbers_in_order(generated)
+def compose(repo: str, tag: str, base: str, prefix: str | None) -> str:
+    last_release = get_last_release(repo, prefix)
+    since = last_release["published_at"] if last_release else None
+    previous_tag = last_release["tag_name"] if last_release else None
 
+    prs = list_merged_prs(repo, base, since)
+
+    by_category: dict[str, list[str]] = {}
     summary_lines = []
     breaking_lines = []
-    for n in numbers:
+    for pr in prs:
+        n = pr["number"]
+        category, title_breaking = categorize(pr["title"])
+        by_category.setdefault(category, []).append(
+            f"* {pr['title']} by @{pr['author']['login']} in {pr['url']}"
+        )
+
         body = fetch_pr_body(repo, n)
         note = extract_note(body)
         if note:
             summary_lines.append(f"- {note} (#{n})")
+
         breaking = extract_breaking(body)
         if breaking:
             breaking_lines.append(f"- {breaking} (#{n})")
+        elif title_breaking and note:
+            # Title says breaking but no dedicated marker was filled in.
+            breaking_lines.append(f"- {note} (#{n})")
 
-    # Strip the HTML config comment GitHub prepends; keep What's Changed + Full Changelog.
-    body = re.sub(r"^<!--.*?-->\n\n?", "", generated, flags=re.DOTALL)
+    parts = ["## What's Changed"]
+    for category in CATEGORY_ORDER:
+        if category in by_category:
+            parts.append(f"### {category}\n" + "\n".join(by_category[category]))
+    whats_changed = "\n".join(parts)
 
-    whats_changed, _, rest = body.partition("## New Contributors")
-    if not rest:
-        whats_changed, _, rest = body.partition("**Full Changelog**")
-        full_changelog = "**Full Changelog**" + rest
-    else:
-        # Drop New Contributors section; keep Full Changelog line from what follows it.
-        fc_match = re.search(r"\*\*Full Changelog\*\*.*", rest, re.DOTALL)
-        full_changelog = fc_match.group(0) if fc_match else ""
-
-    parts = [whats_changed.rstrip()]
+    body_parts = [whats_changed]
 
     if breaking_lines:
-        parts.append("### Breaking Changes\n\n" + "\n".join(breaking_lines))
+        body_parts.append("### Breaking Changes\n\n" + "\n".join(breaking_lines))
 
     if summary_lines:
-        parts.append("### Summary\n\n" + "\n".join(summary_lines))
+        body_parts.append("### Summary\n\n" + "\n".join(summary_lines))
 
-    parts.append(full_changelog.strip())
+    if previous_tag:
+        body_parts.append(f"**Full Changelog**: https://github.com/{repo}/compare/{previous_tag}...{tag}")
 
-    return "\n\n".join(p for p in parts if p) + "\n"
+    return "\n\n".join(body_parts) + "\n"
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo", required=True, help="OWNER/REPO")
-    parser.add_argument("--tag", required=True, help="the tag/release being cut")
+    parser.add_argument("--tag", required=True, help="the tag/release being cut (need not exist yet)")
+    parser.add_argument("--base", default="master", help="base branch PRs merge into (default: master)")
     parser.add_argument(
-        "--previous-tag",
-        required=True,
-        help="the previous tag FOR THIS PACKAGE (not just 'the last release')",
+        "--prefix",
+        default=None,
+        help="package tag prefix, e.g. 'gllm_inference-v' — scopes 'last release' "
+        "to that package instead of the whole monorepo. Omit for single-package repos.",
     )
     args = parser.parse_args()
 
-    print(compose(args.repo, args.tag, args.previous_tag))
+    print(compose(args.repo, args.tag, args.base, args.prefix))
     return 0
 
 
