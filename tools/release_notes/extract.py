@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Deterministic release-note composer.
 
-No LLM calls, no tag required to already exist, no dependency on PR labels.
+No LLM calls. Uses GitHub's own `generate-notes` API (the same one behind the
+"Generate release notes" button and `gh release create --generate-notes`) for
+the "## What's Changed" list and "Full Changelog" link — that endpoint already
+handles PR discovery, author attribution, and edge cases (co-authors, force-
+pushes, etc.) robustly, so there's no reason to reimplement it.
 
-The PR range is found from the last published release's timestamp (via the
-Releases API), not from local/manual git tags. "## What's Changed" is a flat
-list of merged PRs, in the same order GitHub's own generated notes use — no
-category subheadings. Each merged PR's body is then read for the
+The one thing that endpoint gets wrong by default is `previous_tag_name`: left
+unset, it picks "the most recent release across the whole repo," not "the
+most recent release for this package" — wrong the moment a repo has more than
+one release lineage. So this script computes that tag itself (most recently
+published release, optionally scoped by `--prefix`, always excluding `--tag`
+itself so re-running after publish doesn't just find itself) and passes it in
+explicitly.
+
+On top of GitHub's own body, each merged PR's body is read for the
 `<!-- release-note:start -->...<!-- release-note:end -->` marker to build a
 "### Summary" section directly beneath it, one bullet per user-facing PR.
 A PR whose title carries the Conventional Commit "!" (`feat!: ...`) or whose
@@ -14,9 +23,13 @@ body has a filled-in `<!-- release-note-breaking:start -->...-end -->` marker
 gets its summary bullet prefixed with "**Breaking:**" instead of a separate
 section.
 
+Note: for "## What's Changed" to come back as a flat list with no category
+subheadings, don't add a `.github/release.yml` with `changelog.categories` —
+that's what triggers GitHub's own label-based grouping.
+
 Usage:
     python extract.py --repo OWNER/REPO --tag v0.3.2
-    python extract.py --repo OWNER/REPO --tag v0.3.2 --prefix gllm_inference-v --base main
+    python extract.py --repo OWNER/REPO --tag v0.3.2 --prefix gllm_inference-v
 
 Requires: `gh` CLI authenticated, Python 3.9+.
 """
@@ -27,7 +40,6 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
 
 NOTE_RE = re.compile(
     r"<!--\s*release-note:start\s*-->(.*?)<!--\s*release-note:end\s*-->",
@@ -39,8 +51,9 @@ BREAKING_RE = re.compile(
 )
 
 # Conventional Commit PR title: "type(scope)!: subject". Scope and "!" optional.
-# The "!" is the only part we need — it's the title-level breaking-change signal.
 TITLE_RE = re.compile(r"^[a-zA-Z]+(?:\([^)]*\))?(?P<bang>!)?:\s*.+$")
+
+PR_LINE_RE = re.compile(r"^\*\s.*?/pull/(\d+)\s*$", re.MULTILINE)
 
 
 def run_gh(args: list[str]) -> str:
@@ -51,13 +64,10 @@ def run_gh(args: list[str]) -> str:
 def get_last_release(repo: str, prefix: str | None, exclude_tag: str | None = None) -> dict | None:
     """Most recently published release, optionally scoped to a package's tag prefix.
 
-    Reads straight from the Releases API — no local git tags involved, so this
-    works even in a checkout that never fetched tags.
-
     `exclude_tag` matters when this runs *after* the release being composed has
-    already been published (e.g. a post-publish workflow reacting to the
-    release you just created) — without excluding it, "most recent" would just
-    find itself and produce an empty range.
+    already been published (e.g. a workflow reacting to the tag push that just
+    created it) — without excluding it, "most recent" would just find itself
+    and produce an empty range.
     """
     releases = json.loads(run_gh(["api", f"repos/{repo}/releases", "--paginate"]))
     if prefix:
@@ -70,30 +80,22 @@ def get_last_release(repo: str, prefix: str | None, exclude_tag: str | None = No
     return releases[0]
 
 
-def list_merged_prs(repo: str, base: str, since: str | None) -> list[dict]:
-    """Merged PRs against `base`, merged after `since` (ISO8601), oldest first."""
-    out = run_gh(
-        [
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--state",
-            "merged",
-            "--base",
-            base,
-            "--limit",
-            "200",
-            "--json",
-            "number,title,mergedAt,url,author",
-        ]
-    )
-    prs = json.loads(out)
-    if since:
-        since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
-        prs = [p for p in prs if datetime.fromisoformat(p["mergedAt"].replace("Z", "+00:00")) > since_dt]
-    prs.sort(key=lambda p: p["mergedAt"])
-    return prs
+def generate_notes(repo: str, tag: str, previous_tag: str | None) -> str:
+    args = ["api", f"repos/{repo}/releases/generate-notes", "-f", f"tag_name={tag}"]
+    if previous_tag:
+        args += ["-f", f"previous_tag_name={previous_tag}"]
+    out = run_gh(args)
+    return json.loads(out)["body"]
+
+
+def pr_numbers_in_order(generated_body: str) -> list[int]:
+    # "## New Contributors" bullets have the same "* ... /pull/N" shape as the
+    # "## What's Changed" PR list and would otherwise duplicate PRs.
+    whats_changed = generated_body.split("## New Contributors")[0]
+    seen: dict[int, None] = {}
+    for n in PR_LINE_RE.findall(whats_changed):
+        seen[int(n)] = None
+    return list(seen)
 
 
 def is_breaking_title(title: str) -> bool:
@@ -102,9 +104,9 @@ def is_breaking_title(title: str) -> bool:
     return bool(m and m.group("bang") == "!")
 
 
-def fetch_pr_body(repo: str, number: int) -> str:
-    out = run_gh(["pr", "view", str(number), "--repo", repo, "--json", "body"])
-    return json.loads(out)["body"] or ""
+def fetch_pr(repo: str, number: int) -> dict:
+    out = run_gh(["pr", "view", str(number), "--repo", repo, "--json", "title,body"])
+    return json.loads(out)
 
 
 def extract_note(body: str) -> str | None:
@@ -127,25 +129,30 @@ def extract_breaking(body: str) -> str | None:
     return " ".join(text.split())
 
 
-def compose(repo: str, tag: str, base: str, prefix: str | None) -> str:
-    # Excluding `tag` itself is always safe: if it doesn't exist yet (the normal,
-    # pre-publish case) this filters nothing; if it already exists (a workflow
-    # reacting to the release it's about to rewrite) this stops "most recent
-    # release" from just finding itself and producing an empty range.
+def compose(repo: str, tag: str, prefix: str | None) -> str:
     last_release = get_last_release(repo, prefix, exclude_tag=tag)
-    since = last_release["published_at"] if last_release else None
     previous_tag = last_release["tag_name"] if last_release else None
 
-    prs = list_merged_prs(repo, base, since)
+    generated = generate_notes(repo, tag, previous_tag)
+    numbers = pr_numbers_in_order(generated)
 
-    whats_changed_lines = []
+    # Strip GitHub's own leading HTML comment (only present when release.yml exists).
+    generated = re.sub(r"^<!--.*?-->\n\n?", "", generated, flags=re.DOTALL)
+
+    # Isolate "**Full Changelog**:" first — with zero PRs in range there's no
+    # "## What's Changed" heading at all, so partitioning on "## New
+    # Contributors" (usually absent too) would leave the changelog line stuck
+    # inside `whats_changed`, and it'd get emitted twice.
+    full_changelog_match = re.search(r"\*\*Full Changelog\*\*.*", generated, re.DOTALL)
+    full_changelog = full_changelog_match.group(0).strip() if full_changelog_match else None
+    before_changelog = generated[: full_changelog_match.start()] if full_changelog_match else generated
+    whats_changed = before_changelog.split("## New Contributors")[0].strip()
+
     summary_lines = []
-    for pr in prs:
-        n = pr["number"]
+    for n in numbers:
+        pr = fetch_pr(repo, n)
         title_breaking = is_breaking_title(pr["title"])
-        whats_changed_lines.append(f"* {pr['title']} by @{pr['author']['login']} in {pr['url']}")
-
-        body = fetch_pr_body(repo, n)
+        body = pr["body"] or ""
         note = extract_note(body)
         breaking = extract_breaking(body) or (note if title_breaking else None)
 
@@ -154,13 +161,13 @@ def compose(repo: str, tag: str, base: str, prefix: str | None) -> str:
         elif note:
             summary_lines.append(f"- {note} (#{n})")
 
-    body_parts = ["## What's Changed\n" + "\n".join(whats_changed_lines)]
+    body_parts = [whats_changed or "## What's Changed\n_No PRs found in range._"]
 
     if summary_lines:
         body_parts.append("### Summary\n\n" + "\n".join(summary_lines))
 
-    if previous_tag:
-        body_parts.append(f"**Full Changelog**: https://github.com/{repo}/compare/{previous_tag}...{tag}")
+    if full_changelog:
+        body_parts.append(full_changelog.strip())
 
     return "\n\n".join(body_parts) + "\n"
 
@@ -169,7 +176,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo", required=True, help="OWNER/REPO")
     parser.add_argument("--tag", required=True, help="the tag/release being cut (need not exist yet)")
-    parser.add_argument("--base", default="master", help="base branch PRs merge into (default: master)")
     parser.add_argument(
         "--prefix",
         default=None,
@@ -178,7 +184,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    print(compose(args.repo, args.tag, args.base, args.prefix))
+    print(compose(args.repo, args.tag, args.prefix))
     return 0
 
 
