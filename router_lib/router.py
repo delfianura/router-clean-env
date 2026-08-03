@@ -33,6 +33,12 @@ class Router:
         self._routes = [r for r in self._routes if r.name != name]
         self._cache.clear()
 
+    def set_priority(self, name: str, priority: int) -> None:
+        for r in self._routes:
+            if r.name == name:
+                r.priority = priority
+        self._cache.clear()
+
     _MISS = object()
 
     def route(self, text: str) -> str | None:
