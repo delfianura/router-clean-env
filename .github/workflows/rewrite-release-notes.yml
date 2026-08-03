@@ -23,10 +23,12 @@ jobs:
       - name: Compose notes from PR release-note markers
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           python3 tools/release_notes/extract.py \
-            --repo "${{ github.repository }}" \
-            --tag "${{ github.event.release.tag_name }}" \
+            --repo "$REPO" \
+            --tag "$TAG_NAME" \
             > /tmp/notes.md
 
-          gh release edit "${{ github.event.release.tag_name }}" --notes-file /tmp/notes.md
+          gh release edit "$TAG_NAME" --notes-file /tmp/notes.md
