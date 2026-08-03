@@ -14,10 +14,16 @@ class Route:
 class Router:
     """Routes an incoming query to the highest-priority matching route."""
 
-    def __init__(self, routes: list[Route] | None = None, cache_ttl: float | None = None) -> None:
+    def __init__(
+        self,
+        routes: list[Route] | None = None,
+        cache_ttl: float | None = None,
+        default_route: str | None = None,
+    ) -> None:
         self._routes: list[Route] = routes or []
         self._cache_ttl = cache_ttl
         self._cache: dict[str, tuple[str | None, float]] = {}
+        self._default_route = default_route
 
     def add_route(self, route: Route) -> None:
         self._routes.append(route)
@@ -37,7 +43,7 @@ class Router:
     def _best_match(self, query: str) -> str | None:
         matches = [r for r in self._routes if any(k in query for k in r.keywords)]
         if not matches:
-            return None
+            return self._default_route
         matches.sort(key=lambda r: r.priority, reverse=True)
         return matches[0].name
 
