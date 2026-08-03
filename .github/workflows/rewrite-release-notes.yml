@@ -1,34 +1,30 @@
 name: Rewrite release notes from PR markers
 
-# The tag is created the moment a NON-draft release is created (`gh release
-# create` with no --draft, or the UI's one-shot "Publish release" on a fresh
-# tag) — and tag push is what fires build-binary.yml, which fires
-# send-release-email.yml at the end. There is no server-side moment between
-# "release exists with default/wrong notes" and "tag pushed, downstream
-# workflows already running" for that path — GitHub creates both atomically.
+# Tested and ruled out: reacting to `release: created` while draft==true, to
+# fix notes before anyone publishes and creates the tag. GitHub Actions does
+# not fire the `release` event for draft creation at all — confirmed by
+# creating a real draft release here and observing zero workflow runs. So
+# there is no server-side moment between "release+tag created together" and
+# "tag pushed" for a direct (non-draft) release — they happen atomically.
 #
-# The only way to guarantee correct notes BEFORE the tag exists is to react
-# to `release: created` while the release is still a draft: drafting (via
-# `gh release create --draft` or the UI's "Save draft") creates the release
-# object — including whatever "Generate release notes" produced — without
-# creating the tag. The tag is only created when the draft is later
-# published. So: rewrite immediately on draft creation, before anyone
-# publishes it.
-#
-# `released` is kept as a best-effort fallback for anyone who publishes
-# directly without drafting first — by then the tag has already fired
-# build-binary.yml, but the release notes themselves are still corrected
-# after the fact rather than left wrong permanently.
+# What IS achievable: finishing before the notes are actually *read* by
+# anything downstream. build-binary.yml triggers on this same tag push and
+# runs a multi-OS build + PyPI/Artifact-Registry publish chain that takes
+# minutes before its last job calls send-release-email.yml. Triggering here
+# on the identical tag push runs this in parallel with that chain — composing
+# notes is a handful of API calls (seconds), so it reliably finishes and
+# corrects the release body long before send-release-email.yml's job is
+# reached, even though the tag/build already started.
 on:
-  release:
-    types: [created, released]
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
 
 jobs:
   rewrite-notes:
-    if: github.event.release.draft == true || github.event.action == 'released'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,11 +33,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG_NAME: ${{ github.event.release.tag_name }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
+          # A tag can be pushed without a Release object existing yet (e.g. a
+          # bare `git push --tags`) — nothing to edit in that case, skip.
+          if ! gh release view "$TAG_NAME" --repo "$REPO" >/dev/null 2>&1; then
+            echo "No release found for tag $TAG_NAME, skipping."
+            exit 0
+          fi
+
           python3 tools/release_notes/extract.py \
             --repo "$REPO" \
             --tag "$TAG_NAME" \
             > /tmp/notes.md
 
-          gh release edit "$TAG_NAME" --notes-file /tmp/notes.md
+          gh release edit "$TAG_NAME" --repo "$REPO" --notes-file /tmp/notes.md
