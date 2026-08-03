@@ -1,21 +1,34 @@
 name: Rewrite release notes from PR markers
 
-# Fires after ANY release is published — whether it was cut with
-# `gh release create --generate-notes`, GitHub's "Generate release notes"
-# button in the UI, or hand-written notes. GitHub's own generator has no
-# hook for reading arbitrary PR-body content, so instead of trying to shape
-# what gets generated up front, this rewrites the notes immediately after
-# publish using tools/release_notes/extract.py, which pulls each merged PR's
-# <!-- release-note:start/end --> marker into a "### Summary" section.
+# The tag is created the moment a NON-draft release is created (`gh release
+# create` with no --draft, or the UI's one-shot "Publish release" on a fresh
+# tag) — and tag push is what fires build-binary.yml, which fires
+# send-release-email.yml at the end. There is no server-side moment between
+# "release exists with default/wrong notes" and "tag pushed, downstream
+# workflows already running" for that path — GitHub creates both atomically.
+#
+# The only way to guarantee correct notes BEFORE the tag exists is to react
+# to `release: created` while the release is still a draft: drafting (via
+# `gh release create --draft` or the UI's "Save draft") creates the release
+# object — including whatever "Generate release notes" produced — without
+# creating the tag. The tag is only created when the draft is later
+# published. So: rewrite immediately on draft creation, before anyone
+# publishes it.
+#
+# `released` is kept as a best-effort fallback for anyone who publishes
+# directly without drafting first — by then the tag has already fired
+# build-binary.yml, but the release notes themselves are still corrected
+# after the fact rather than left wrong permanently.
 on:
   release:
-    types: [released]
+    types: [created, released]
 
 permissions:
   contents: write
 
 jobs:
   rewrite-notes:
+    if: github.event.release.draft == true || github.event.action == 'released'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
