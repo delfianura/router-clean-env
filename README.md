@@ -114,3 +114,5 @@ uv sync
 ```
 
 ## Simulated feature: per-call timeout
+
+## Simulated fix: retry leak
