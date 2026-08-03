@@ -31,33 +31,33 @@ class Router:
 
     _MISS = object()
 
-    def route(self, query: str) -> str | None:
-        cached = self._cache_get(query)
+    def route(self, text: str) -> str | None:
+        cached = self._cache_get(text)
         if cached is not self._MISS:
             return cached
 
-        result = self._best_match(query)
-        self._cache_set(query, result)
+        result = self._best_match(text)
+        self._cache_set(text, result)
         return result
 
-    def _best_match(self, query: str) -> str | None:
-        matches = [r for r in self._routes if any(k in query for k in r.keywords)]
+    def _best_match(self, text: str) -> str | None:
+        matches = [r for r in self._routes if any(k in text for k in r.keywords)]
         if not matches:
             return self._default_route
         matches.sort(key=lambda r: r.priority, reverse=True)
         return matches[0].name
 
-    def _cache_get(self, query: str):
+    def _cache_get(self, text: str):
         if self._cache_ttl is None:
             return self._MISS
-        cached = self._cache.get(query)
+        cached = self._cache.get(text)
         if cached is not None and time.monotonic() - cached[1] < self._cache_ttl:
             return cached[0]
         return self._MISS
 
-    def _cache_set(self, query: str, result: str | None) -> None:
+    def _cache_set(self, text: str, result: str | None) -> None:
         if self._cache_ttl is not None:
-            self._cache[query] = (result, time.monotonic())
+            self._cache[text] = (result, time.monotonic())
 
-    def route_many(self, queries: list[str]) -> list[str | None]:
-        return [self.route(q) for q in queries]
+    def route_many(self, texts: list[str]) -> list[str | None]:
+        return [self.route(t) for t in texts]
