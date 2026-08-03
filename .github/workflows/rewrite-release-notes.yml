@@ -1,0 +1,32 @@
+name: Rewrite release notes from PR markers
+
+# Fires after ANY release is published — whether it was cut with
+# `gh release create --generate-notes`, GitHub's "Generate release notes"
+# button in the UI, or hand-written notes. GitHub's own generator has no
+# hook for reading arbitrary PR-body content, so instead of trying to shape
+# what gets generated up front, this rewrites the notes immediately after
+# publish using tools/release_notes/extract.py, which pulls each merged PR's
+# <!-- release-note:start/end --> marker into a "### Summary" section.
+on:
+  release:
+    types: [released]
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose notes from PR release-note markers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 tools/release_notes/extract.py \
+            --repo "${{ github.repository }}" \
+            --tag "${{ github.event.release.tag_name }}" \
+            > /tmp/notes.md
+
+          gh release edit "${{ github.event.release.tag_name }}" --notes-file /tmp/notes.md

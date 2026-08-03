@@ -48,15 +48,22 @@ def run_gh(args: list[str]) -> str:
     return result.stdout
 
 
-def get_last_release(repo: str, prefix: str | None) -> dict | None:
+def get_last_release(repo: str, prefix: str | None, exclude_tag: str | None = None) -> dict | None:
     """Most recently published release, optionally scoped to a package's tag prefix.
 
     Reads straight from the Releases API — no local git tags involved, so this
     works even in a checkout that never fetched tags.
+
+    `exclude_tag` matters when this runs *after* the release being composed has
+    already been published (e.g. a post-publish workflow reacting to the
+    release you just created) — without excluding it, "most recent" would just
+    find itself and produce an empty range.
     """
     releases = json.loads(run_gh(["api", f"repos/{repo}/releases", "--paginate"]))
     if prefix:
         releases = [r for r in releases if r["tag_name"].startswith(prefix)]
+    if exclude_tag:
+        releases = [r for r in releases if r["tag_name"] != exclude_tag]
     if not releases:
         return None
     releases.sort(key=lambda r: r["published_at"], reverse=True)
@@ -121,7 +128,11 @@ def extract_breaking(body: str) -> str | None:
 
 
 def compose(repo: str, tag: str, base: str, prefix: str | None) -> str:
-    last_release = get_last_release(repo, prefix)
+    # Excluding `tag` itself is always safe: if it doesn't exist yet (the normal,
+    # pre-publish case) this filters nothing; if it already exists (a workflow
+    # reacting to the release it's about to rewrite) this stops "most recent
+    # release" from just finding itself and producing an empty range.
+    last_release = get_last_release(repo, prefix, exclude_tag=tag)
     since = last_release["published_at"] if last_release else None
     previous_tag = last_release["tag_name"] if last_release else None
 
