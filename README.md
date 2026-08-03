@@ -112,3 +112,5 @@ Then run:
 ```bash
 uv sync
 ```
+
+## Simulated feature: per-call timeout
